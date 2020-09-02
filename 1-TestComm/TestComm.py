@@ -195,6 +195,7 @@ class IniParser:
     __TestIndex = 0
     __CommIndex = 0
     __TestFinish = False
+    __Mode = 0
 
     #--------------------------init--------------------------#
 
@@ -220,6 +221,11 @@ class IniParser:
         self.__TestIndex = 1
         self.__CommIndex = int(self.__CurTest["StrIndex"])
 
+        Result = self.__DealMode()
+
+        if 0 != Result:
+            return Result
+
         return Result
 
     def AddCommIndex(self):
@@ -237,6 +243,9 @@ class IniParser:
 
     def GetCommIndex(self):
         return self.__CommIndex
+
+    def GetMode(self):
+        return self.__Mode
 
     #--------------------------method--------------------------#
 
@@ -293,6 +302,7 @@ class IniParser:
                     TestIndex["Crc"]
                     TestIndex["SendTimes"]
                     TestIndex["UseCha"]
+                    TestIndex["CandID"]
 
                 except:
                     zcanpro.write_log("Less Parm in "+Test)
@@ -314,13 +324,30 @@ class IniParser:
                 self.__CommIndex = int(self.__CurTest["StrIndex"])
             else:
                 self.__TestFinish = True
+
+    def __DealMode(self):
+
+        boardType = self.__TestInfo["BoardType"]
+
+        if type('str') == type(boardType):
+            if "MS" == boardType:
+                self.__Mode = "MS_Mode"
+            else:
+                self.__Mode = "EXE_Mode"
+        else:
+            zcanpro.write_log("More than one board in BoardType!")
+            return -1
+
+        zcanpro.write_log("Mode:" + self.__Mode)
+        return 0
+
 #--------------------------------------------------------class--------------------------------------------------------#
 class BoardParser:
     #--------------------------property--------------------------#
     BoardType = "NULL"
-    IDType = {"MS":0}
+    IDType = {"MS":0, "DI":1, "DO":2, "FI":3, "AI":4, "REV":6}
     IDAorB = {"A":0, "B":1}
-    IDPkgType = {"State":1,"Ver":2,"Req":3}
+    IDPkgType = {"State":1, "Ver":2, "Req":3, "Req2":6}
 
     headStru = {"Time":0, "Index":0, "Len":64, "Type":0, "MorS":0}
     channel = {"Cha1": [0], "Cha2": [1], "ChaAll": [0,1]}
@@ -347,7 +374,7 @@ class BoardParser:
 
         return id
 
-    def run(self, iniPar):
+    def run(self, iniPar, recvData):
         pass
 
     def frame(self, pkgType, timeStamp, index, crcm, crc):
@@ -415,7 +442,7 @@ class BoardParser:
         for index in range(crcbyte):
             self.crcCrcM.append((crc >> (8 * index)) & 0xFF)
 
-    def make_board_type(self,strType ,strAB):
+    def make_board_type(self, strType ,strAB):
         board = self.IDType[strType] * 2 + self.IDAorB[strAB]
 
         return board
@@ -458,7 +485,7 @@ class MSParser(BoardParser):
         self.zCanPro = zCanPro
 
     #--------------------------interface--------------------------#
-    def run(self, iniPar):
+    def run(self, iniPar, recvData):
 
         testInfo = iniPar.GetTestInfo()
         self.__mOrSValue = self.__mOrS[testInfo["MorS"]]
@@ -496,7 +523,10 @@ class MSParser(BoardParser):
                 strType = "State"
                 self.__sysRunCmd = 0x1111
 
-            id = self.make_id(testInfo["BoardType"], testInfo["SysAorB"], strType)
+            if "NULL" == curTest["CandID"]:
+                id = self.make_id(self.BoardType, testInfo["SysAorB"], strType)
+            else:
+                id = int(curTest["CandID"])
 
             #get current test
             pkgType = self.__pkgType[strType]
@@ -550,14 +580,355 @@ class MSParser(BoardParser):
 
     #--------------------------method--------------------------#
 
+#--------------------------------------------------------class--------------------------------------------------------#
+class ExeParser(BoardParser):
+    #--------------------------property--------------------------#
+    replyNum = 0
+    __sendIndex = 1
+    pkgType = {"State": 1, "Ver": 2, "Req": 3, "Req2":6}
+    __timeStamp = 0
+    __boardType = 0
+    __sysRunCmd = 0
 
-##############################################################################################
+    stateValueData = []
+    verValueData = []
+    reqValueData = []
+    req2ValueData = []
+
+    #--------------------------init--------------------------#
+
+    def __init__(self, zCanPro):
+        self.BoardType = "NULL"
+        self.zCanPro = zCanPro
+
+    #--------------------------interface--------------------------#
+    def run(self, iniPar, recvData):
+
+        testInfo = iniPar.GetTestInfo()
+
+        self.__boardType = self.make_board_type(testInfo["BoardType"], testInfo["SysAorB"])
+
+        if False == iniPar.IsTestFinish() \
+                and len(recvData["type"]) == len(recvData["timeStamp"]) \
+                and 0 < len(recvData["type"]):
+
+            for recvIndex in range(len(recvData["type"])):
+                if 1 == self.replyNum or \
+                        (2 == self.replyNum and "Req" != recvData["type"][recvIndex]):
+
+                    curTest = iniPar.GetCurTest()
+
+                    strType = recvData["type"][recvIndex]
+                    self.__sysRunCmd = 0x3333
+
+                    if "NULL" == curTest["CandID"]:
+                        id = self.make_id(self.BoardType, testInfo["SysAorB"], strType)
+                    else:
+                        id = int(curTest["CandID"])
+
+                    if "NULL" != curTest["TimeStampOffset"]:
+                        self.__timeStamp += int(curTest["TimeStampOffset"])
+                    else:
+                        self.__timeStamp = recvData["timeStamp"][recvIndex]
+
+                    #get current test
+                    pkgType = self.pkgType[strType]
+                    timeStamp = self.__timeStamp
+                    index = iniPar.GetCommIndex()
+                    crcm = curTest["CrcM"]
+                    crc = curTest["Crc"]
+                    sendTimes = int(curTest["SendTimes"])
+                    useCha = curTest["UseCha"]
+
+                    self.frame(pkgType, timeStamp, index, crcm, crc)
+
+                    for sendIndex in range(sendTimes):
+                        self.send(id, useCha)
+
+                    self.__sendIndex += 1
+                    iniPar.AddCommIndex()
+
+                elif 2 == self.replyNum and "Req" == recvData["type"][recvIndex]:
+                    #pkg 1
+                    curTest = iniPar.GetCurTest()
+
+                    strType = recvData["type"][recvIndex]
+                    self.__sysRunCmd = 0x3333
+
+                    if "NULL" == curTest["CandID"]:
+                        id = self.make_id(self.BoardType, testInfo["SysAorB"], strType)
+                    else:
+                        id = int(curTest["CandID"])
+
+                    self.__timeStamp = recvData["timeStamp"][recvIndex]
+                    if "NULL" != curTest["TimeStampOffset"]:
+                        self.__timeStamp += int(curTest["TimeStampOffset"])
+
+                    # get current test
+                    pkgType = self.pkgType[strType]
+                    timeStamp = self.__timeStamp
+                    index = iniPar.GetCommIndex()
+                    crcm = curTest["CrcM"]
+                    crc = curTest["Crc"]
+                    sendTimes = int(curTest["SendTimes"])
+                    useCha = curTest["UseCha"]
+
+                    self.frame(pkgType, timeStamp, index, crcm, crc)
+
+                    for sendIndex in range(sendTimes):
+                        self.send(id, useCha)
+
+                    self.__sendIndex += 1
+                    iniPar.AddCommIndex()
+
+                    # pkg 2
+                    curTest = iniPar.GetCurTest()
+
+                    strType = "Req2"
+                    self.__sysRunCmd = 0x3333
+
+                    if "NULL" == curTest["CandID"]:
+                        id = self.make_id(self.BoardType, testInfo["SysAorB"], strType)
+                    else:
+                        id = int(curTest["CandID"])
+
+                    self.__timeStamp = recvData["timeStamp"][recvIndex]
+                    if "NULL" != curTest["TimeStampOffset"]:
+                        self.__timeStamp += int(curTest["TimeStampOffset"])
+
+                    # get current test
+                    pkgType = self.pkgType[strType]
+                    timeStamp = self.__timeStamp
+                    index = iniPar.GetCommIndex()
+                    crcm = curTest["CrcM"]
+                    crc = curTest["Crc"]
+                    sendTimes = int(curTest["SendTimes"])
+                    useCha = curTest["UseCha"]
+
+                    self.frame(pkgType, timeStamp, index, crcm, crc)
+
+                    for sendIndex in range(sendTimes):
+                        self.send(id, useCha)
+
+                    self.__sendIndex += 1
+                    iniPar.AddCommIndex()
+
+
+
+    def frame(self, pkgType, timeStamp, index, crcm, crc):
+
+        # headStru = {"Time":0, "Index":0, "Len":64, "Type":0, "MorS":0}
+        self.headStru["Time"] = timeStamp
+        self.headStru["Index"] = index
+        self.headStru["Len"] = 64
+        self.headStru["Type"] = pkgType
+        self.headStru["MorS"] = 0
+
+        self.frame_headdata()
+        self.frame_valuedata(pkgType)
+        self.frame_crc_crcm(crcm, crc)
+
+
+    def frame_valuedata(self, pkgType):
+
+        self.valueData.clear()
+        if self.pkgType["State"] == pkgType:
+            self.valueData.extend(self.stateValueData)
+            self.valueData[0] = self.__boardType & 0xff
+            self.valueData[20] = self.__sysRunCmd & 0xff
+            self.valueData[21] = (self.__sysRunCmd >> 8) & 0xff
+
+        elif self.pkgType["Ver"] == pkgType:
+            self.valueData.extend(self.verValueData)
+            self.valueData[0] = self.__boardType & 0xff
+
+        elif self.pkgType["Req"] == pkgType:
+            self.valueData.extend(self.reqValueData)
+
+        elif self.pkgType["Req2"] == pkgType:
+            self.valueData.extend(self.req2ValueData)
+
+    #--------------------------method--------------------------#
+
+#--------------------------------------------------------class--------------------------------------------------------#
+class DIParser(ExeParser):
+    #--------------------------property--------------------------#
+
+    __stateValueData = [0x03,0x00,0x33,0x33,0x00,0x00,0x00,0x00,0x7f,0xff,
+                        0xff,0x00,0xff,0xff,0xff,0xff,0xc1,0x0c,0x50,0x0c,
+                        0x7c,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00]
+    __verValueData = [0x03,0x00,0x01,0x00,0x78,0x56,0x34,0x12,0x44,0x44,
+                      0x33,0x33,0x22,0x22,0x11,0x11,0x74,0x20,0x01,0x10,
+                      0x75,0x20,0x01,0x10,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x4f,0x03,0x7c,0x01,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+    __reqValueData = [0x28,0x00,0x00,0xb2,0x10,0x00,0x55,0x55,0x55,0x55,
+                      0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,
+                      0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,
+                      0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x86,0xad,
+                      0x10,0x46]
+
+    #--------------------------init--------------------------#
+
+    def __init__(self, zCanPro):
+        self.BoardType = "DI"
+        self.replyNum = 1
+        self.zCanPro = zCanPro
+
+        self.stateValueData.clear()
+        self.stateValueData.extend(self.__stateValueData)
+        self.verValueData.clear()
+        self.verValueData.extend(self.__verValueData)
+        self.reqValueData.clear()
+        self.reqValueData.extend(self.__reqValueData)
+
+    #--------------------------interface--------------------------#
+
+    # --------------------------method--------------------------#
+
+#--------------------------------------------------------class--------------------------------------------------------#
+class DOParser(ExeParser):
+    #--------------------------property--------------------------#
+
+    __stateValueData = [0x04,0x00,0x33,0x33,0x00,0x00,0x00,0x00,0x7f,0xff,
+                        0x03,0x00,0xff,0xff,0xff,0xff,0xcd,0x0d,0x29,0x0b,
+                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00]
+    __verValueData = [0x04,0x00,0x01,0x00,0x78,0x56,0x34,0x12,0x44,0x44,
+                      0x33,0x33,0x22,0x22,0x11,0x11,0x76,0x20,0x01,0x10,
+                      0x77,0x20,0x01,0x10,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x33,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+    __reqValueData = [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+
+    #--------------------------init--------------------------#
+
+    def __init__(self, zCanPro):
+        self.BoardType = "DO"
+        self.replyNum = 1
+        self.zCanPro = zCanPro
+
+        self.stateValueData.clear()
+        self.stateValueData.extend(self.__stateValueData)
+        self.verValueData.clear()
+        self.verValueData.extend(self.__verValueData)
+        self.reqValueData.clear()
+        self.reqValueData.extend(self.__reqValueData)
+
+        self.IDPkgType["Req"] = 5
+        self.pkgType["Req"] = 5
+
+    #--------------------------interface--------------------------#
+
+    # --------------------------method--------------------------#
+
+#--------------------------------------------------------class--------------------------------------------------------#
+class FIParser(ExeParser):
+    #--------------------------property--------------------------#
+
+    __stateValueData = [0x06,0x00,0x33,0x33,0x00,0x00,0x00,0x00,0x7f,0x03,
+                        0x00,0x00,0xff,0xff,0xff,0xff,0x02,0x0d,0xb6,0x0c,
+                        0x13,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00]
+    __verValueData = [0x06,0x00,0x01,0x00,0x78,0x56,0x34,0x12,0x44,0x44,
+                      0x33,0x33,0x22,0x22,0x11,0x11,0x78,0x20,0x01,0x10,
+                      0x79,0x20,0x01,0x10,0x60,0x20,0x00,0x00,0x60,0x20,
+                      0x00,0x00,0x93,0x1d,0x13,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+    __reqValueData = [0x24,0x00,0x01,0xa4,0x0e,0x00,0xff,0xff,0xff,0xff,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,
+                      0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0xff,0xff,0x00,0x00,0x66,0xa7,0x6b,0x27,0x00,0x00,
+                      0x00,0x00]
+    __req2ValueData = [0x24,0x00,0x02,0xa4,0x0e,0x00,0xff,0xff,0xff,0xff,
+                       0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,
+                       0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                       0xff,0xff,0x00,0x00,0x42,0x76,0xdc,0x4c,0x00,0x00,
+                       0x00,0x00]
+
+    #--------------------------init--------------------------#
+
+    def __init__(self, zCanPro):
+        self.BoardType = "FI"
+        self.replyNum = 2
+        self.zCanPro = zCanPro
+
+        self.stateValueData.clear()
+        self.stateValueData.extend(self.__stateValueData)
+        self.verValueData.clear()
+        self.verValueData.extend(self.__verValueData)
+        self.reqValueData.clear()
+        self.reqValueData.extend(self.__reqValueData)
+        self.req2ValueData.clear()
+        self.req2ValueData.extend(self.__req2ValueData)
+
+    #--------------------------interface--------------------------#
+
+    # --------------------------method--------------------------#
+
+#--------------------------------------------------------class--------------------------------------------------------#
+class AIParser(ExeParser):
+    #--------------------------property--------------------------#
+
+    __stateValueData = [0x08,0x00,0x33,0x33,0x00,0x00,0x00,0x00,0x7f,0x00,
+                        0x00,0x00,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,
+                        0x61,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                        0x00,0x00]
+    __verValueData = [0x08,0x00,0x01,0x00,0x78,0x56,0x34,0x12,0x44,0x44,
+                      0x33,0x33,0x22,0x22,0x11,0x11,0x73,0x20,0x00,0x00,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00,0x64,0x03,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+    __reqValueData = [0x1c,0x00,0x00,0xa6,0x0a,0x00,0x55,0x55,0x00,0x00,
+                      0x55,0x55,0x00,0x00,0x55,0x55,0x00,0x00,0x55,0x55,
+                      0x00,0x00,0x55,0x55,0x00,0x00,0xac,0xaa,0x79,0xbd,
+                      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                      0x00,0x00]
+    __req2ValueData = [0x18,0x00,0x00,0xa5,0x02,0x00,0x00,0x00,0x00,0x00,
+                       0x23,0x4e,0xf4,0xcc,0x00,0xa1,0x02,0x00,0x00,0x00,
+                       0x00,0x00,0x87,0xdd,0xa2,0xa1,0x00,0x00,0x00,0x00,
+                       0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                       0x00,0x00]
+
+    #--------------------------init--------------------------#
+
+    def __init__(self, zCanPro):
+        self.BoardType = "AI"
+        self.replyNum = 2
+        self.zCanPro = zCanPro
+
+        self.stateValueData.clear()
+        self.stateValueData.extend(self.__stateValueData)
+        self.verValueData.clear()
+        self.verValueData.extend(self.__verValueData)
+        self.reqValueData.clear()
+        self.reqValueData.extend(self.__reqValueData)
+        self.req2ValueData.clear()
+        self.req2ValueData.extend(self.__req2ValueData)
+
+    #--------------------------interface--------------------------#
+
+    # --------------------------method--------------------------#
+
+
 #--------------------------------------------------------canpro--------------------------------------------------------#
 stopTask = False
 
 class ZCanPro:
     #--------------------------property--------------------------#
     buses = 0
+    __msAID = (0x1, 0x2, 0x3)
+    __msBID = (0x81, 0x82, 0x83)
+    __pkgType = ("State", "Ver", "Req")
     #--------------------------init--------------------------#
 
     def __init__(self):
@@ -582,8 +953,33 @@ class ZCanPro:
             zcanpro.write_log("id-" + str(id))
             zcanpro.write_log("data len-" + str(len(data)))
             zcanpro.write_log("Transmit error!")
-            while not stopTask:
-                pass
+
+    def recv_deal_data(self):
+
+        recvData = {"type":[], "timeStamp":[]}
+
+        #only use channel 0
+        result, frms = zcanpro.receive(self.buses[0]["busID"])
+        if not result:
+            zcanpro.write_log("Receive error!")
+        elif len(frms) > 0:
+            for dataIndex in range(len(frms)):
+                for idIndex in range(len(self.__msAID)):
+
+                    if self.__msAID[idIndex] == frms[dataIndex]["can_id"] or \
+                            self.__msBID[idIndex] == frms[dataIndex]["can_id"]:
+
+                        recvData["type"].append(self.__pkgType[idIndex])
+
+                        timeStamp = 0
+                        for timeIndex in range(8):
+                            timeStamp <<= 8
+                            timeStamp += frms[dataIndex]["data"][7 - timeIndex]
+
+                        recvData["timeStamp"].append(timeStamp)
+                        break
+
+        return  recvData
 
     #--------------------------interface--------------------------#
 
@@ -617,28 +1013,38 @@ def z_main():
         return
 
 #init Board
-    BoardGroup = []
-    MSPar = MSParser(zCanPro)
-
-    BoardGroup.append(MSPar)
-
-    CurBDPar = "NULL"
-    CurBoardType = iniPar.GetTestInfo()["BoardType"]
-    zcanpro.write_log(CurBoardType)
-    for BDPar in BoardGroup:
-        if True == BDPar.is_belong(CurBoardType):
-            CurBDPar = BDPar
-            zcanpro.write_log("Find Board Parser")
-            break
-
-    if "NULL" == CurBDPar:
+    boardType = iniPar.GetTestInfo()["BoardType"]
+    if "MS" == boardType:
+        useBDPar = MSParser(zCanPro)
+    elif "DI" == boardType:
+        useBDPar = DIParser(zCanPro)
+    elif "DO" == boardType:
+        useBDPar = DOParser(zCanPro)
+    elif "FI" == boardType:
+        useBDPar = FIParser(zCanPro)
+    elif "AI" == boardType:
+        useBDPar = AIParser(zCanPro)
+    else:
         zcanpro.write_log("Cant Find Board Parser")
         return
 
+    zcanpro.write_log("Find Board Parser:" + boardType)
+
 #Run
+
+    mode = iniPar.GetMode()
+
     while not stopTask:
 
-        CurBDPar.run(iniPar)
+        # deal recv
+        if "EXE_Mode" == mode:
+            recvData = zCanPro.recv_deal_data()
+            if 0 < len(recvData):
+                time.sleep(0.001)
+        else:
+            recvData = "NULL"
+
+        useBDPar.run(iniPar, recvData)
 
         if True == iniPar.IsTestFinish():
             zcanpro.write_log("Comm Test Finish!")
